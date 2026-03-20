@@ -165,10 +165,10 @@ export default function App() {
         tags: suggestions.tags
       }));
       setStep('suggestions');
-    } catch (err) {
+    } catch (err: any) {
       setError({ 
         message: 'Image analysis failed.', 
-        details: 'The AI could not identify the object clearly. Try a clearer photo or check your connection.' 
+        details: err.message || 'The AI could not identify the object clearly. Try a clearer photo or check your connection.' 
       });
     } finally {
       setLoading(false);
