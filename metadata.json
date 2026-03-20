@@ -1,0 +1,7 @@
+{
+  "name": "Math Trails Task Generator",
+  "description": "AI-powered tool to create engaging STEM tasks from real-world images for Math Trails learning.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
