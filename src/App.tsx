@@ -47,6 +47,8 @@ const compressImage = async (base64Str: string, maxWidth = 1024, quality = 0.7):
       ctx?.drawImage(img, 0, 0, width, height);
       resolve(canvas.toDataURL('image/jpeg', quality));
     };
+    // Formats the browser can't decode (e.g. HEIC) would otherwise hang forever.
+    img.onerror = () => resolve(base64Str);
   });
 };
 
