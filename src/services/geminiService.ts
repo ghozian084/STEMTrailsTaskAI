@@ -1,16 +1,28 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { Type } from "@google/genai";
 
 // Primary model first; later entries are fallbacks used when the primary is
 // overloaded, rate-limited or unavailable.
 const MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"];
 const MAX_RETRIES_PER_MODEL = 2;
 
-const getAI = () => {
-  const apiKey = process.env.GEMINI_API_KEY || (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-    throw new Error("API key is missing. Please add GEMINI_API_KEY to your environment variables and rebuild the app.");
+class ApiError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
   }
-  return new GoogleGenAI({ apiKey });
+}
+
+// Calls the server-side proxy (api/gemini.ts), which holds the API key.
+const callGemini = async (model: string, contents: any[], responseSchema: any): Promise<string> => {
+  const res = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model, contents, config: { responseSchema } }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new ApiError(data?.error?.message || `Request failed (${res.status})`, data?.error?.code || res.status);
+  }
+  return data?.text ?? "";
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,6 +37,7 @@ const getStatus = (err: any): number | undefined => {
 // network failures, model-not-found, and malformed/empty model output.
 const isRetryable = (err: any) => {
   if (err?.name === "InvalidResponseError") return true;
+  if (/api key/i.test(String(err?.message || ""))) return false;
   const status = getStatus(err);
   if (status === 404 || status === 408 || status === 429 || (status !== undefined && status >= 500)) return true;
   return /fetch|network|overloaded|unavailable|timeout/i.test(String(err?.message || ""));
@@ -41,6 +54,9 @@ const toFriendlyError = (err: any): Error => {
     // not JSON, keep raw message
   }
   const status = getStatus(err);
+  if (/api key is missing/i.test(message)) {
+    return new Error("API key is missing. Add GEMINI_API_KEY in Vercel → Project → Settings → Environment Variables, then redeploy.");
+  }
   if (status === 400 && /api key/i.test(message)) {
     return new Error("The Gemini API key is invalid. Please check GEMINI_API_KEY.");
   }
@@ -78,17 +94,11 @@ const generateJson = async <T>(
   responseSchema: any,
   normalize: (data: any) => T
 ): Promise<T> => {
-  const ai = getAI();
   let lastError: any;
   for (const model of MODELS) {
     for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt++) {
       try {
-        const response = await ai.models.generateContent({
-          model,
-          contents,
-          config: { responseMimeType: "application/json", responseSchema },
-        });
-        return normalize(parseJson(response.text));
+        return normalize(parseJson(await callGemini(model, contents, responseSchema)));
       } catch (err: any) {
         lastError = err;
         if (!isRetryable(err)) throw toFriendlyError(err);
