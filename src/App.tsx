@@ -17,14 +17,18 @@ import {
   Image as ImageIcon,
   Loader2,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  RotateCcw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import 'katex/dist/katex.min.css';
 import { InlineMath, BlockMath } from 'react-katex';
-import { analyzeImage, generateTask, Suggestion, GeneratedTask } from './services/geminiService';
+import { analyzeImage, generateTask, Suggestion, GeneratedTask, SHAPES } from './services/geminiService';
+import { SavedTask, loadSavedTasks, saveTask, deleteTask, makeThumbnail, newId } from './lib/savedTasks';
+import TasksPage from './components/TasksPage';
+import HelpPage from './components/HelpPage';
 
 // Image compression utility
 const compressImage = async (base64Str: string, maxWidth = 1024, quality = 0.7): Promise<string> => {
@@ -82,10 +86,7 @@ const LatexRenderer = ({ text }: { text: string }) => {
 };
 
 type Step = 'upload' | 'suggestions' | 'measurements' | 'output';
-
-const SHAPES = [
-  'Rectangle', 'Square', 'Circle', 'Triangle', 'Right Triangle', 'Cylinder', 'Sphere', 'Cube', 'Cuboid', 'Pyramid', 'Cone', 'Combination of Shapes'
-];
+type Page = 'dashboard' | 'tasks' | 'help';
 
 const SUB_SHAPES = [
   'Rectangle', 'Square', 'Circle', 'Triangle', 'Right Triangle', 'Cylinder', 'Sphere', 'Cube', 'Cuboid', 'Pyramid', 'Cone'
@@ -130,23 +131,102 @@ const GRADES = [
 ];
 
 export default function App() {
+  const [page, setPage] = useState<Page>('dashboard');
   const [step, setStep] = useState<Step>('upload');
+  const [savedTasks, setSavedTasks] = useState<SavedTask[]>(() => loadSavedTasks());
+  const [savedId, setSavedId] = useState<string | null>(null);
   const [state, setState] = useState<TaskState>(INITIAL_STATE);
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState<string | null>(null);
-  const [error, setError] = useState<{ message: string; details?: string } | null>(null);
+  const [error, setError] = useState<{ message: string; details?: string; retry?: () => void } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const loadFile = (file: File | undefined) => {
+    if (!file || loading) return;
+    if (!file.type.startsWith('image/')) {
+      setError({ message: 'Unsupported file.', details: 'Please choose an image file (JPG, PNG or WebP).' });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const compressed = await compressImage(reader.result as string);
+      setState({ ...INITIAL_STATE, image: compressed });
+      analyze(compressed);
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const compressed = await compressImage(reader.result as string);
-        setState(prev => ({ ...prev, image: compressed }));
-        analyze(compressed);
-      };
-      reader.readAsDataURL(file);
+    loadFile(e.target.files?.[0]);
+    // Reset so choosing the same photo again still triggers onChange.
+    e.target.value = '';
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragging(false);
+    loadFile(e.dataTransfer.files?.[0]);
+  };
+
+  const startOver = () => {
+    setState(INITIAL_STATE);
+    setError(null);
+    setSavedId(null);
+    setStep('upload');
+    setPage('dashboard');
+  };
+
+  const goTo = (target: Page) => {
+    setPage(target);
+    window.scrollTo({ top: 0 });
+  };
+
+  const openSavedTask = (t: SavedTask) => {
+    setState({
+      ...INITIAL_STATE,
+      image: t.image,
+      objectName: t.objectName,
+      geometricShape: t.geometricShape,
+      answerFormat: t.answerFormat as TaskState['answerFormat'],
+      selectedTask: t.taskDescription ? 'custom' : '',
+      customTask: t.taskDescription || '',
+      measurements: t.measurements || {},
+      numSubtasks: t.task.subtasks?.length || 0,
+      grade: t.grade,
+      tools: t.tools,
+      tags: t.tags,
+      generatedTask: t.task,
+    });
+    setSavedId(t.id);
+    setStep('output');
+    goTo('dashboard');
+  };
+
+  const persistTask = async (task: GeneratedTask) => {
+    if (!state.image) return;
+    const record: SavedTask = {
+      id: newId(),
+      savedAt: Date.now(),
+      thumbnail: await makeThumbnail(state.image),
+      image: state.image,
+      objectName: state.objectName,
+      geometricShape: state.geometricShape,
+      answerFormat: state.answerFormat,
+      grade: state.grade,
+      tools: state.tools,
+      tags: state.tags,
+      taskDescription: state.selectedTask === 'custom' ? state.customTask : state.selectedTask,
+      measurements: state.measurements,
+      task,
+    };
+    try {
+      setSavedTasks(saveTask(record));
+      setSavedId(record.id);
+    } catch {
+      setSavedId(null);
+      setError({ message: 'Task not saved.', details: 'Browser storage is full. Delete some tasks on the Tasks page.' });
     }
   };
 
@@ -170,7 +250,8 @@ export default function App() {
     } catch (err: any) {
       setError({ 
         message: 'Image analysis failed.', 
-        details: err.message || 'The AI could not identify the object clearly. Try a clearer photo or check your connection.' 
+        details: err.message || 'The AI could not identify the object clearly. Try a clearer photo or check your connection.',
+        retry: () => analyze(image)
       });
     } finally {
       setLoading(false);
@@ -189,22 +270,29 @@ export default function App() {
       setLoadingMessage('Still working... Complex math and subtasks take extra time to process.');
     }, 8000);
 
+    const fields = getCurrentMeasurementFields();
+    const measurements: Record<string, string> = Object.fromEntries(
+      (Object.entries(state.measurements) as [string, string][]).filter(([k, v]) => fields.includes(k) && v !== '')
+    );
+
     try {
       const task = await generateTask(
         state.image,
         state.objectName,
         state.geometricShape,
         state.selectedTask === 'custom' ? state.customTask : state.selectedTask,
-        state.measurements,
+        measurements,
         state.answerFormat,
         state.numSubtasks
       );
       setState(prev => ({ ...prev, generatedTask: task }));
       setStep('output');
+      persistTask(task);
     } catch (err: any) {
       setError({ 
         message: 'Task generation failed.', 
-        details: err.message || 'This often happens with complex combined shapes or many subtasks. Try reducing subtasks or simplifying measurements.' 
+        details: err.message || 'This often happens with complex combined shapes or many subtasks. Try reducing subtasks or simplifying measurements.',
+        retry: handleGenerate
       });
     } finally {
       clearTimeout(timer);
@@ -213,8 +301,14 @@ export default function App() {
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setError({ message: 'Copy failed.', details: 'Your browser blocked clipboard access. Select the text and copy it manually.' });
+    }
   };
 
   const getMeasurementFields = (shape: string) => {
@@ -234,6 +328,18 @@ export default function App() {
     }
   };
 
+  const getCurrentMeasurementFields = () => {
+    if (state.geometricShape !== 'Combination of Shapes') return getMeasurementFields(state.geometricShape);
+    const fields: string[] = [];
+    state.selectedSubShapes.forEach(s => {
+      getMeasurementFields(s).forEach(f => {
+        const uniqueField = `${s}: ${f}`;
+        if (!fields.includes(uniqueField)) fields.push(uniqueField);
+      });
+    });
+    return fields;
+  };
+
   const renderStep = () => {
     switch (step) {
       case 'upload':
@@ -247,8 +353,11 @@ export default function App() {
             </div>
 
             <div 
-              className="w-full max-w-2xl p-12 border-2 border-dashed border-slate-200 rounded-3xl bg-white shadow-sm hover:border-indigo-400 transition-colors cursor-pointer group flex flex-col items-center space-y-6"
-              onClick={() => fileInputRef.current?.click()}
+              className={cn("w-full max-w-2xl p-12 border-2 border-dashed rounded-3xl bg-white shadow-sm hover:border-indigo-400 transition-colors cursor-pointer group flex flex-col items-center space-y-6", dragging ? "border-indigo-500 bg-indigo-50" : "border-slate-200")}
+              onClick={() => !loading && fileInputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={handleDrop}
             >
               <div className="w-20 h-20 bg-indigo-50 rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform">
                 <Camera className="w-10 h-10 text-indigo-600" />
@@ -417,28 +526,29 @@ export default function App() {
 
               <button 
                 onClick={() => setStep('measurements')}
-                className="w-full py-5 bg-indigo-600 text-white rounded-2xl font-bold text-lg hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2"
+                disabled={
+                  (state.selectedTask === 'custom' && !state.customTask.trim()) ||
+                  (state.geometricShape === 'Combination of Shapes' && state.selectedSubShapes.length === 0)
+                }
+                className="w-full py-5 disabled:opacity-50 disabled:cursor-not-allowed bg-indigo-600 text-white rounded-2xl font-bold text-lg hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2"
               >
                 Next Step
                 <ChevronRight className="w-5 h-5" />
+              </button>
+
+              <button 
+                onClick={startOver}
+                className="w-full py-3 text-slate-500 rounded-2xl font-semibold hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+              >
+                <RotateCcw className="w-4 h-4" />
+                Use a different photo
               </button>
             </div>
           </div>
         );
 
       case 'measurements':
-        let measurementFields: string[] = [];
-        if (state.geometricShape === 'Combination of Shapes') {
-          state.selectedSubShapes.forEach(s => {
-            const fields = getMeasurementFields(s);
-            fields.forEach(f => {
-              const uniqueField = `${s}: ${f}`;
-              if (!measurementFields.includes(uniqueField)) measurementFields.push(uniqueField);
-            });
-          });
-        } else {
-          measurementFields = getMeasurementFields(state.geometricShape);
-        }
+        const measurementFields = getCurrentMeasurementFields();
 
         return (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-start">
@@ -763,9 +873,24 @@ export default function App() {
             <div className="flex items-center justify-between">
               <div className="space-y-1">
                 <h1 className="text-4xl font-bold text-slate-900">Generated Task</h1>
-                <p className="text-slate-500">Review and copy your STEM task sections.</p>
+                <p className="text-slate-500 flex items-center gap-2">
+                  Review and copy your STEM task sections.
+                  {savedId && (
+                    <button onClick={() => goTo('tasks')} className="inline-flex items-center gap-1 text-emerald-600 font-semibold text-sm hover:underline">
+                      <CheckCircle2 className="w-4 h-4" />
+                      Saved to Tasks
+                    </button>
+                  )}
+                </p>
               </div>
-              <div className="flex gap-3">
+              <div className="flex flex-wrap gap-3">
+                <button 
+                  onClick={startOver}
+                  className="px-6 py-3 bg-white border border-slate-200 text-slate-600 rounded-xl font-semibold hover:bg-slate-50 transition-all flex items-center gap-2"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  New Photo
+                </button>
                 <button 
                   onClick={() => setStep('suggestions')}
                   className="px-6 py-3 bg-white border border-slate-200 text-slate-600 rounded-xl font-semibold hover:bg-slate-50 transition-all flex items-center gap-2"
@@ -801,20 +926,31 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 font-sans text-slate-900">
       {/* Header */}
       <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md border-b border-slate-200">
-        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-20 flex items-center justify-between">
+          <div className="flex items-center gap-3 cursor-pointer" onClick={() => goTo('dashboard')}>
             <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center">
               <Calculator className="w-6 h-6 text-white" />
             </div>
-            <span className="text-xl font-bold tracking-tight">MathTrails AI</span>
+            <span className="hidden sm:inline text-xl font-bold tracking-tight">MathTrails AI</span>
           </div>
-          <nav className="hidden md:flex items-center gap-8">
-            <a href="#" className="text-sm font-semibold text-indigo-600">Dashboard</a>
-            <a href="#" className="text-sm font-semibold text-slate-500 hover:text-slate-900 transition-colors">Tasks</a>
-            <a href="#" className="text-sm font-semibold text-slate-500 hover:text-slate-900 transition-colors">Help</a>
-            <button className="px-5 py-2.5 bg-slate-900 text-white rounded-xl text-sm font-bold hover:bg-slate-800 transition-all">
-              Sign In
-            </button>
+          <nav className="flex items-center gap-1 sm:gap-2">
+            {([['dashboard', 'Dashboard'], ['tasks', 'Tasks'], ['help', 'Help']] as [Page, string][]).map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => goTo(key)}
+                className={cn(
+                  "px-3 py-2 rounded-xl text-sm font-semibold transition-colors flex items-center gap-1.5",
+                  page === key ? "text-indigo-600 bg-indigo-50" : "text-slate-500 hover:text-slate-900"
+                )}
+              >
+                {label}
+                {key === 'tasks' && savedTasks.length > 0 && (
+                  <span className="min-w-5 h-5 px-1.5 bg-indigo-600 text-white rounded-full text-[11px] leading-5 text-center">
+                    {savedTasks.length}
+                  </span>
+                )}
+              </button>
+            ))}
           </nav>
         </div>
       </header>
@@ -823,13 +959,27 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-12">
         <AnimatePresence mode="wait">
           <motion.div
-            key={step}
+            key={page === 'dashboard' ? step : page}
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
             transition={{ duration: 0.3 }}
           >
-            {renderStep()}
+            {page === 'tasks' ? (
+              <TasksPage
+                tasks={savedTasks}
+                onOpen={openSavedTask}
+                onDelete={(id) => {
+                  setSavedTasks(deleteTask(id));
+                  if (id === savedId) setSavedId(null);
+                }}
+                onCreate={startOver}
+              />
+            ) : page === 'help' ? (
+              <HelpPage onStart={startOver} />
+            ) : (
+              renderStep()
+            )}
           </motion.div>
         </AnimatePresence>
       </main>
@@ -847,6 +997,14 @@ export default function App() {
         </div>
       </footer>
 
+      {/* Copied Toast */}
+      {copied && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-2 text-sm font-semibold">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          Copied to clipboard
+        </div>
+      )}
+
       {/* Error Toast */}
       {error && (
         <div className="fixed bottom-8 right-8 bg-white border-2 border-red-100 p-6 rounded-3xl shadow-2xl flex flex-col gap-4 max-w-sm animate-in slide-in-from-right-8">
@@ -860,15 +1018,18 @@ export default function App() {
             </div>
           </div>
           <div className="flex gap-2">
-            <button 
-              onClick={() => {
-                setError(null);
-                handleGenerate();
-              }}
-              className="flex-1 py-2 bg-red-600 text-white rounded-xl text-sm font-bold hover:bg-red-700 transition-colors"
-            >
-              Retry
-            </button>
+            {error.retry && (
+              <button 
+                onClick={() => {
+                  const retry = error.retry;
+                  setError(null);
+                  retry?.();
+                }}
+                className="flex-1 py-2 bg-red-600 text-white rounded-xl text-sm font-bold hover:bg-red-700 transition-colors"
+              >
+                Retry
+              </button>
+            )}
             <button 
               onClick={() => setError(null)} 
               className="px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-sm font-bold hover:bg-slate-200 transition-colors"
