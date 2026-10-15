@@ -125,6 +125,10 @@ const asString = (v: any): string => (v === undefined || v === null ? "" : Strin
 const asStringArray = (v: any): string[] =>
   Array.isArray(v) ? v.map(asString).filter(Boolean) : v ? [asString(v)] : [];
 
+export const SHAPES = [
+  'Rectangle', 'Square', 'Circle', 'Triangle', 'Right Triangle', 'Cylinder', 'Sphere', 'Cube', 'Cuboid', 'Pyramid', 'Cone', 'Combination of Shapes'
+];
+
 export interface Suggestion {
   objectName: string;
   geometricShape: string;
@@ -177,6 +181,7 @@ export const analyzeImage = async (base64Image: string): Promise<Suggestion> => 
         4. Clarity: The task suggested must be clear and unambiguous.
 
         The tasks should integrate STEM Education (Science, Technology, Engineering, and Mathematics), with a strong focus on Mathematics Education (e.g., geometry, trigonometry, algebra, statistics).
+        For "geometricShape", choose exactly one of: ${SHAPES.map((x) => `"${x}"`).join(", ")}.
         For "grade", choose exactly one of: "Grade 1-2", "Grade 3-4", "Grade 5-6", "Grade 7-8", "High School", "University".
         Return the result in JSON format.`,
       },
@@ -185,7 +190,7 @@ export const analyzeImage = async (base64Image: string): Promise<Suggestion> => 
       type: Type.OBJECT,
       properties: {
         objectName: { type: Type.STRING },
-        geometricShape: { type: Type.STRING },
+        geometricShape: { type: Type.STRING, enum: SHAPES },
         tasks: { type: Type.ARRAY, items: { type: Type.STRING }, minItems: "3", maxItems: "3" },
         grade: { type: Type.STRING },
         tools: { type: Type.ARRAY, items: { type: Type.STRING } },
